@@ -240,11 +240,17 @@ def extract_checkout_data(checkout: dict) -> Optional[dict]:
         billing  = checkout.get("billing_address") or {}
         addr     = shipping or billing
 
-        first_name = addr.get("first_name", "")
-        last_name  = addr.get("last_name", "")
+        # IMPORTANT: use `.get(key) or default`, NOT `.get(key, default)`.
+        # Shopify often sends explicit JSON nulls (e.g. "first_name": null)
+        # rather than omitting the key — `.get(key, default)` only falls
+        # back to default when the KEY IS MISSING, not when its value is
+        # None. That previously let literal "None" leak into customer_name
+        # and get spoken aloud by the agent on real calls.
+        first_name = addr.get("first_name") or ""
+        last_name  = addr.get("last_name") or ""
         full_name  = f"{first_name} {last_name}".strip()
         if not full_name:
-            email     = checkout.get("email", "")
+            email     = checkout.get("email") or ""
             full_name = email.split("@")[0] if email else "Client"
 
         raw_phone = checkout.get("phone") or addr.get("phone") or ""
@@ -252,9 +258,9 @@ def extract_checkout_data(checkout: dict) -> Optional[dict]:
         if not phone:
             return None
 
-        line_items    = checkout.get("line_items", [])
+        line_items    = checkout.get("line_items") or []
         items_summary = ", ".join(
-            f"{item.get('title', 'Produs')} x{item.get('quantity', 1)}"
+            f"{(item.get('title') or 'Produs')} x{(item.get('quantity') or 1)}"
             for item in line_items[:3]
         )
         if len(line_items) > 3:
@@ -269,11 +275,11 @@ def extract_checkout_data(checkout: dict) -> Optional[dict]:
         address = {
             "first_name":   first_name,
             "last_name":    last_name,
-            "address1":     addr.get("address1", ""),
-            "city":         addr.get("city", ""),
-            "province":     addr.get("province", ""),
-            "zip":          addr.get("zip", ""),
-            "country_code": addr.get("country_code", "RO"),
+            "address1":     addr.get("address1") or "",
+            "city":         addr.get("city") or "",
+            "province":     addr.get("province") or "",
+            "zip":          addr.get("zip") or "",
+            "country_code": addr.get("country_code") or "RO",
             "phone":        phone,
         }
         has_address     = bool(address["address1"] and address["city"])
@@ -282,11 +288,11 @@ def extract_checkout_data(checkout: dict) -> Optional[dict]:
         return {
             "customer_name":   full_name,
             "phone":           phone,
-            "email":           checkout.get("email", ""),
+            "email":           checkout.get("email") or "",
             "cart_items":      items_summary,
             "cart_value":      cart_value,
             "discount_code":   "",
-            "checkout_token":  checkout.get("token", ""),
+            "checkout_token":  checkout.get("token") or "",
             "line_items":      line_items,
             "address":         address,
             "has_address":     "da" if has_address else "nu",
