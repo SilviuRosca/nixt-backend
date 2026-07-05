@@ -24,7 +24,8 @@ scheduler.start()
 
 # ── ENV VARS ──
 SHOPIFY_STORE           = os.environ.get("SHOPIFY_STORE", "")
-SHOPIFY_ADMIN_TOKEN     = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")
+SHOPIFY_CLIENT_ID       = os.environ.get("SHOPIFY_CLIENT_ID", "")
+SHOPIFY_CLIENT_SECRET   = os.environ.get("SHOPIFY_CLIENT_SECRET", "")   # this is the "Client Token" (shpss_...)
 RETELL_API_KEY          = os.environ.get("RETELL_API_KEY", "")
 RETELL_AGENT_ID         = os.environ.get("RETELL_AGENT_ID", "")
 RETELL_FROM_NUMBER      = os.environ.get("RETELL_FROM_NUMBER", "")
@@ -100,6 +101,15 @@ class _FakeRedis:
     def keys(self, pattern):
         prefix = pattern.rstrip("*")
         return [k for k in list(self._store.keys()) if k.startswith(prefix) and not self._expired(k)]
+
+    def ttl(self, key):
+        self._purge(key)
+        if key not in self._store:
+            return -2
+        exp = self._expiry.get(key)
+        if exp is None:
+            return -1
+        return max(int(exp - datetime.now(timezone.utc).timestamp()), 0)
 
 
 try:
@@ -288,14 +298,70 @@ def extract_checkout_data(checkout: dict) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────
+# SHOPIFY — OAUTH CLIENT CREDENTIALS GRANT
+# ─────────────────────────────────────────────
+# Since Jan 1 2026, Shopify no longer issues permanent shpat_ tokens for new
+# custom apps. Instead, we exchange SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET
+# for a short-lived (24h) access token via the OAuth client_credentials grant.
+# https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/client-credentials-grant
+
+def get_shopify_access_token() -> str:
+    """
+    Returns a valid Shopify Admin API access token, cached in Redis.
+    Refreshes automatically ~5 minutes before the real 24h expiry.
+    """
+    cached = redis_client.get("shopify_access_token")
+    if cached:
+        return cached
+
+    resp = requests.post(
+        f"https://{SHOPIFY_STORE}/admin/oauth/access_token",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        data={
+            "grant_type":    "client_credentials",
+            "client_id":     SHOPIFY_CLIENT_ID,
+            "client_secret": SHOPIFY_CLIENT_SECRET,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data       = resp.json()
+    token      = data["access_token"]
+    expires_in = data.get("expires_in", 86399)
+
+    ttl = max(expires_in - 300, 60)  # refresh 5 min early, never cache for <60s
+    redis_client.set("shopify_access_token", token, ex=ttl)
+    log.info(f"Fetched new Shopify access token, expires in {expires_in}s")
+    return token
+
+
+def shopify_api_request(method: str, path: str, **kwargs) -> requests.Response:
+    """
+    Wraps a Shopify Admin API call using the cached OAuth token.
+    If Shopify rejects the cached token (401), clears the cache and retries
+    once with a freshly fetched token.
+    """
+    url     = f"https://{SHOPIFY_STORE}{path}"
+    headers = kwargs.pop("headers", {})
+    headers["X-Shopify-Access-Token"] = get_shopify_access_token()
+
+    resp = requests.request(method, url, headers=headers, **kwargs)
+    if resp.status_code == 401:
+        log.warning("Shopify token rejected mid-flight — refreshing and retrying once")
+        redis_client.delete("shopify_access_token")
+        headers["X-Shopify-Access-Token"] = get_shopify_access_token()
+        resp = requests.request(method, url, headers=headers, **kwargs)
+    return resp
+
+
+# ─────────────────────────────────────────────
 # SHOPIFY — ABANDONED CHECKOUTS POLLING
 # ─────────────────────────────────────────────
 
 def fetch_abandoned_checkouts() -> list:
     try:
-        resp = requests.get(
-            f"https://{SHOPIFY_STORE}/admin/api/2024-01/checkouts.json",
-            headers={"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN},
+        resp = shopify_api_request(
+            "GET", "/admin/api/2024-01/checkouts.json",
             params={"status": "abandoned", "limit": 250},
             timeout=15,
         )
@@ -402,9 +468,9 @@ def place_cod_order(call_id: str) -> dict:
     if not line_items:
         raise ValueError("No line items with variant_id — cannot create order")
 
-    resp = requests.post(
-        f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json",
-        headers={"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"},
+    resp = shopify_api_request(
+        "POST", "/admin/api/2024-01/orders.json",
+        headers={"Content-Type": "application/json"},
         json={
             "order": {
                 "line_items":       line_items,
@@ -440,9 +506,16 @@ def health():
         redis_status = "connected"
     except Exception as e:
         redis_status = f"error: {e}"
+
+    try:
+        shopify_token_ttl = redis_client.ttl("shopify_access_token")
+    except Exception:
+        shopify_token_ttl = None
+
     return jsonify({
         "status":                  "ok",
         "redis":                   redis_status,
+        "shopify_token_ttl_seconds": shopify_token_ttl,
         "calls_today":             calls_made_today(),
         "max_calls_per_day":       MAX_CALLS_PER_DAY,
         "poll_interval_minutes":   POLL_INTERVAL_MINUTES,
