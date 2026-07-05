@@ -381,6 +381,14 @@ def fetch_abandoned_checkouts() -> list:
         return []
 
 
+def _parse_created_at(ts: str) -> datetime:
+    """Parses Shopify's ISO8601 created_at for sorting. Unparseable -> oldest possible."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
 def process_abandoned_checkouts():
     """
     Runs every POLL_INTERVAL_MINUTES.
@@ -393,6 +401,11 @@ def process_abandoned_checkouts():
 
     raw_checkouts = fetch_abandoned_checkouts()
     log.info(f"Poll cycle: {len(raw_checkouts)} abandoned checkouts from Shopify")
+
+    # Shopify's checkouts.json has no `order`/`sort` param (only since_id,
+    # which paginates ascending) — the default is oldest-first. Sort here
+    # so we call the NEWEST eligible abandoned checkouts first instead.
+    raw_checkouts.sort(key=lambda c: _parse_created_at(c.get("created_at", "")), reverse=True)
 
     for raw in raw_checkouts:
         token = raw.get("token", "")
