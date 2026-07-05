@@ -1,13 +1,12 @@
 import os
-import hmac
-import hashlib
-import base64
 import json
 import logging
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 import requests
+import redis
+from retell import Retell
 from apscheduler.schedulers.background import BackgroundScheduler
 
 try:
@@ -20,38 +19,180 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Scheduler for delayed calls ──
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.start()
 
 # ── ENV VARS ──
-SHOPIFY_STORE          = os.environ.get("SHOPIFY_STORE", "")
-SHOPIFY_ADMIN_TOKEN    = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")
-SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
-RETELL_API_KEY         = os.environ.get("RETELL_API_KEY", "")
-RETELL_AGENT_ID        = os.environ.get("RETELL_AGENT_ID", "")
-RETELL_FROM_NUMBER     = os.environ.get("RETELL_FROM_NUMBER", "")
-CALL_DELAY_MINUTES     = int(os.environ.get("CALL_DELAY_MINUTES", "30"))
+SHOPIFY_STORE           = os.environ.get("SHOPIFY_STORE", "")
+SHOPIFY_ADMIN_TOKEN     = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")
+RETELL_API_KEY          = os.environ.get("RETELL_API_KEY", "")
+RETELL_AGENT_ID         = os.environ.get("RETELL_AGENT_ID", "")
+RETELL_FROM_NUMBER      = os.environ.get("RETELL_FROM_NUMBER", "")
+COD_GATEWAY_NAME        = os.environ.get("COD_GATEWAY_NAME", "Cash on Delivery (COD)")
+MAX_CALLS_PER_DAY       = int(os.environ.get("MAX_CALLS_PER_DAY", "10"))
+POLL_INTERVAL_MINUTES   = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
+MIN_ABANDON_AGE_MINUTES = int(os.environ.get("MIN_ABANDON_AGE_MINUTES", "30"))
+REDIS_URL               = os.environ.get("REDIS_URL", "redis://localhost:6379")
+CALLED_TOKEN_TTL_DAYS   = int(os.environ.get("CALLED_TOKEN_TTL_DAYS", "90"))   # matches Shopify's own 3-month abandoned-checkout retention
+ACTIVE_CALL_TTL_SECONDS = int(os.environ.get("ACTIVE_CALL_TTL_SECONDS", "3600"))  # 1h safety net so stale calls don't linger forever
 
-# ── In-memory stores ──
-active_calls: dict  = {}   # call_id       -> checkout data (call is live)
-pending_calls: dict = {}   # checkout_token -> checkout data (waiting for delay timer)
+retell_client = Retell(api_key=RETELL_API_KEY)
+
+
+# ─────────────────────────────────────────────
+# REDIS — shared state across workers/instances
+# ─────────────────────────────────────────────
+
+class _FakeRedis:
+    """
+    Minimal in-memory Redis stand-in for LOCAL TESTING ONLY when no Redis is
+    reachable. Has NONE of Redis's cross-process guarantees — do not rely on
+    this for anything beyond running app.py directly on your own machine.
+    """
+    def __init__(self):
+        self._store: dict = {}
+        self._expiry: dict = {}
+
+    def _expired(self, key):
+        exp = self._expiry.get(key)
+        return exp is not None and datetime.now(timezone.utc).timestamp() > exp
+
+    def _purge(self, key):
+        if self._expired(key):
+            self._store.pop(key, None)
+            self._expiry.pop(key, None)
+
+    def ping(self):
+        return True
+
+    def get(self, key):
+        self._purge(key)
+        return self._store.get(key)
+
+    def set(self, key, value, nx=False, ex=None):
+        self._purge(key)
+        if nx and key in self._store:
+            return None
+        self._store[key] = value
+        if ex:
+            self._expiry[key] = datetime.now(timezone.utc).timestamp() + ex
+        return True
+
+    def incr(self, key, amount=1):
+        self._purge(key)
+        val = int(self._store.get(key, 0)) + amount
+        self._store[key] = str(val)
+        return val
+
+    def expire(self, key, seconds):
+        self._expiry[key] = datetime.now(timezone.utc).timestamp() + seconds
+        return True
+
+    def delete(self, *keys):
+        n = 0
+        for k in keys:
+            if k in self._store:
+                del self._store[k]
+                n += 1
+            self._expiry.pop(k, None)
+        return n
+
+    def keys(self, pattern):
+        prefix = pattern.rstrip("*")
+        return [k for k in list(self._store.keys()) if k.startswith(prefix) and not self._expired(k)]
+
+
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    log.info("Connected to Redis")
+except Exception as e:
+    log.warning(f"Redis unavailable ({e}) — using in-memory fallback. "
+                f"NOT SAFE for multi-worker/multi-instance production use!")
+    redis_client = _FakeRedis()
+
+
+# ─── Active calls (call_id -> checkout data), used by Retell tool callbacks ───
+# Redis-backed so any worker/instance handling the callback can read it,
+# not just the one that happened to trigger the outbound call.
+
+def save_active_call(call_id: str, checkout: dict):
+    redis_client.set(f"call:{call_id}", json.dumps(checkout), ex=ACTIVE_CALL_TTL_SECONDS)
+
+
+def get_active_call(call_id: str) -> Optional[dict]:
+    raw = redis_client.get(f"call:{call_id}")
+    return json.loads(raw) if raw else None
+
+
+def delete_active_call(call_id: str):
+    redis_client.delete(f"call:{call_id}")
+
+
+# ─── Dedup claim (checkout_token), atomic across workers/instances ───
+
+def try_claim_checkout(token: str) -> bool:
+    """
+    Atomically marks a checkout token as claimed. Returns True if THIS call
+    won the claim and should proceed; False if it was already claimed
+    (by this or another process) and should be skipped.
+    """
+    key = f"called:{token}"
+    ttl_seconds = CALLED_TOKEN_TTL_DAYS * 24 * 3600
+    return bool(redis_client.set(key, "1", nx=True, ex=ttl_seconds))
+
+
+def release_claim(token: str):
+    """Called when triggering the call failed, so it can be retried next poll cycle."""
+    redis_client.delete(f"called:{token}")
+
+
+# ─── Daily call counter — UTC-based everywhere to avoid local/UTC drift ───
+
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def calls_made_today() -> int:
+    val = redis_client.get(f"calls:{_today_key()}")
+    return int(val) if val else 0
+
+
+def increment_calls_today() -> int:
+    key = f"calls:{_today_key()}"
+    new_val = redis_client.incr(key)
+    if new_val == 1:
+        redis_client.expire(key, 3 * 24 * 3600)  # safety TTL, well past a single day
+    return new_val
+
+
+# ─────────────────────────────────────────────
+# RETELL SIGNATURE VERIFICATION
+# ─────────────────────────────────────────────
+
+def verify_retell_signature(raw_body: bytes, signature: str) -> bool:
+    """
+    Confirms the request actually came from Retell, per:
+    https://docs.retellai.com/build/conversation-flow/custom-function
+    Uses RETELL_API_KEY as the verification secret — the same key already
+    used to create outbound calls.
+    """
+    if not signature:
+        return False
+    try:
+        return retell_client.verify(
+            raw_body.decode("utf-8"),
+            api_key=RETELL_API_KEY,
+            signature=signature,
+        )
+    except Exception as e:
+        log.error(f"Signature verification error: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-
-def verify_shopify_webhook(data: bytes, hmac_header: str) -> bool:
-    if not SHOPIFY_WEBHOOK_SECRET:
-        log.warning("SHOPIFY_WEBHOOK_SECRET not set — skipping verification")
-        return True
-    digest = hmac.new(
-        SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), data, hashlib.sha256
-    ).digest()
-    computed = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(computed, hmac_header or "")
-
 
 def normalize_phone(phone: str) -> Optional[str]:
     if not phone:
@@ -66,18 +207,25 @@ def normalize_phone(phone: str) -> Optional[str]:
 
 
 def format_address_preview(addr: dict) -> str:
-    parts = [
-        addr.get("address1", ""),
-        addr.get("city", ""),
-        addr.get("province", ""),
-        addr.get("zip", ""),
-    ]
+    parts = [addr.get("address1", ""), addr.get("city", ""), addr.get("province", ""), addr.get("zip", "")]
     return ", ".join(p for p in parts if p)
 
 
-def extract_checkout_data(payload: dict) -> Optional[dict]:
+def is_old_enough(created_at_str: str) -> bool:
+    """Extra age filter on top of Shopify's own ~10min abandonment threshold. UTC-based."""
+    if not created_at_str:
+        return True
     try:
-        checkout = payload.get("checkout", payload)
+        created = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        age_minutes = (datetime.now(timezone.utc) - created).total_seconds() / 60
+        return age_minutes >= MIN_ABANDON_AGE_MINUTES
+    except Exception:
+        return True
+
+
+def extract_checkout_data(checkout: dict) -> Optional[dict]:
+    """`checkout` is one item from Shopify's Abandoned Checkouts REST list."""
+    try:
         shipping = checkout.get("shipping_address") or {}
         billing  = checkout.get("billing_address") or {}
         addr     = shipping or billing
@@ -92,7 +240,6 @@ def extract_checkout_data(payload: dict) -> Optional[dict]:
         raw_phone = checkout.get("phone") or addr.get("phone") or ""
         phone = normalize_phone(raw_phone)
         if not phone:
-            log.info(f"Checkout {checkout.get('token','?')} skipped — no valid phone")
             return None
 
         line_items    = checkout.get("line_items", [])
@@ -114,12 +261,11 @@ def extract_checkout_data(payload: dict) -> Optional[dict]:
             "last_name":    last_name,
             "address1":     addr.get("address1", ""),
             "city":         addr.get("city", ""),
-            "province":     addr.get("province", ""),   # judetul
+            "province":     addr.get("province", ""),
             "zip":          addr.get("zip", ""),
             "country_code": addr.get("country_code", "RO"),
             "phone":        phone,
         }
-
         has_address     = bool(address["address1"] and address["city"])
         address_preview = format_address_preview(address) if has_address else ""
 
@@ -141,14 +287,67 @@ def extract_checkout_data(payload: dict) -> Optional[dict]:
         return None
 
 
-def do_trigger_retell_call(checkout: dict):
-    """
-    Actually fires the Retell outbound call.
-    Called by APScheduler after the delay, or directly from /test/trigger-call.
-    """
-    token = checkout.get("checkout_token", "")
-    pending_calls.pop(token, None)
+# ─────────────────────────────────────────────
+# SHOPIFY — ABANDONED CHECKOUTS POLLING
+# ─────────────────────────────────────────────
 
+def fetch_abandoned_checkouts() -> list:
+    try:
+        resp = requests.get(
+            f"https://{SHOPIFY_STORE}/admin/api/2024-01/checkouts.json",
+            headers={"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN},
+            params={"status": "abandoned", "limit": 250},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("checkouts", [])
+    except requests.HTTPError as e:
+        log.error(f"fetch_abandoned_checkouts HTTP error: {e.response.status_code} {e.response.text}")
+        return []
+    except Exception as e:
+        log.error(f"fetch_abandoned_checkouts error: {e}", exc_info=True)
+        return []
+
+
+def process_abandoned_checkouts():
+    """
+    Runs every POLL_INTERVAL_MINUTES.
+    MAX_CALLS_PER_DAY gates NEW call initiation only — it never blocks
+    finishing a call/order already in progress (see place_cod_order).
+    """
+    if calls_made_today() >= MAX_CALLS_PER_DAY:
+        log.info(f"Daily call limit reached ({MAX_CALLS_PER_DAY}) — skipping poll cycle entirely")
+        return
+
+    raw_checkouts = fetch_abandoned_checkouts()
+    log.info(f"Poll cycle: {len(raw_checkouts)} abandoned checkouts from Shopify")
+
+    for raw in raw_checkouts:
+        token = raw.get("token", "")
+        if not token:
+            continue
+        if not is_old_enough(raw.get("created_at", "")):
+            continue
+        if calls_made_today() >= MAX_CALLS_PER_DAY:
+            log.info("Daily call limit reached mid-cycle — stopping further calls this cycle")
+            break
+
+        # Atomic claim — safe even if multiple workers/instances poll concurrently
+        if not try_claim_checkout(token):
+            continue
+
+        checkout = extract_checkout_data(raw)
+        if not checkout:
+            continue  # no usable phone — claim stays, don't retry this one forever
+
+        result = do_trigger_retell_call(checkout)
+        if not result or not result.get("call_id"):
+            # Call failed to initiate — release the claim so it's retried next cycle
+            release_claim(token)
+
+
+def do_trigger_retell_call(checkout: dict) -> Optional[dict]:
+    """Fires the Retell outbound call. Only touches shared state on success."""
     payload = {
         "from_number": RETELL_FROM_NUMBER,
         "to_number":   checkout["phone"],
@@ -162,7 +361,6 @@ def do_trigger_retell_call(checkout: dict):
             "address_preview": checkout.get("address_preview", ""),
         },
     }
-
     try:
         resp = requests.post(
             "https://api.retellai.com/v2/create-phone-call",
@@ -174,11 +372,61 @@ def do_trigger_retell_call(checkout: dict):
         result  = resp.json()
         call_id = result.get("call_id")
         if call_id:
-            active_calls[call_id] = checkout
-            log.info(f"Call live: {call_id} -> {checkout['phone']} ({checkout['customer_name']})")
+            save_active_call(call_id, checkout)
+            increment_calls_today()
+            log.info(f"Call live: {call_id} -> {checkout['phone']} ({checkout['customer_name']}) "
+                     f"({calls_made_today()}/{MAX_CALLS_PER_DAY} today)")
         return result
     except Exception as e:
         log.error(f"do_trigger_retell_call error: {e}", exc_info=True)
+        return None
+
+
+def place_cod_order(call_id: str) -> dict:
+    """
+    Creates a REAL Shopify order with Cash on Delivery.
+    NOTE: intentionally does NOT check MAX_CALLS_PER_DAY — that cap only
+    gates whether a NEW call gets initiated. A call already in progress,
+    where the customer already said yes, must always be able to finish.
+    """
+    checkout = get_active_call(call_id)
+    if not checkout:
+        raise ValueError(f"No checkout data for call_id: {call_id}")
+
+    addr = checkout["address"]
+    line_items = [
+        {"variant_id": item["variant_id"], "quantity": item.get("quantity", 1)}
+        for item in checkout["line_items"]
+        if item.get("variant_id")
+    ]
+    if not line_items:
+        raise ValueError("No line items with variant_id — cannot create order")
+
+    resp = requests.post(
+        f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json",
+        headers={"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"},
+        json={
+            "order": {
+                "line_items":       line_items,
+                "shipping_address": addr,
+                "billing_address":  addr,
+                "email":            checkout.get("email", ""),
+                "phone":            checkout.get("phone", ""),
+                "financial_status": "pending",
+                "send_receipt":     True,
+                "note":             "Comandă plasată prin agent telefonic AI — plată ramburs",
+                "tags":             "ai-recovery,abandoned-checkout,ramburs",
+                "transactions": [
+                    {"kind": "sale", "status": "pending", "gateway": COD_GATEWAY_NAME}
+                ],
+            }
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    order = resp.json().get("order", {})
+    log.info(f"COD order #{order.get('order_number')} created for {checkout['customer_name']}")
+    return order
 
 
 # ─────────────────────────────────────────────
@@ -187,114 +435,54 @@ def do_trigger_retell_call(checkout: dict):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status":          "ok",
-        "active_calls":    len(active_calls),
-        "pending_calls":   len(pending_calls),
-        "delay_minutes":   CALL_DELAY_MINUTES,
-        "scheduler_jobs":  len(scheduler.get_jobs()),
-    }), 200
-
-
-@app.route("/shopify-webhook", methods=["POST"])
-def shopify_webhook():
-    """
-    Receives Shopify checkout abandonment webhook.
-    Schedules a Retell call after CALL_DELAY_MINUTES.
-    If same checkout fires again (customer updated cart), resets the timer.
-    """
-    raw_body    = request.get_data()
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
-    topic       = request.headers.get("X-Shopify-Topic", "")
-    log.info(f"Webhook: topic={topic}")
-
-    if not verify_shopify_webhook(raw_body, hmac_header):
-        log.warning("Invalid Shopify HMAC — rejected")
-        return jsonify({"error": "Unauthorized"}), 401
-
-    if topic not in ("checkouts/update", "checkouts/create"):
-        return jsonify({"status": "ignored"}), 200
-
     try:
-        payload  = request.get_json(force=True)
-        checkout = extract_checkout_data(payload)
-        if not checkout:
-            return jsonify({"status": "ignored", "reason": "missing_data"}), 200
-
-        token  = checkout["checkout_token"]
-        job_id = f"call_{token}"
-
-        # Reset timer if checkout was updated (customer came back and changed cart)
-        try:
-            scheduler.remove_job(job_id)
-            log.info(f"Timer reset for checkout {token}")
-        except Exception:
-            pass
-
-        run_at = datetime.now() + timedelta(minutes=CALL_DELAY_MINUTES)
-        scheduler.add_job(
-            do_trigger_retell_call,
-            trigger="date",
-            run_date=run_at,
-            args=[checkout],
-            id=job_id,
-        )
-        pending_calls[token] = checkout
-        log.info(f"Call scheduled: {checkout['customer_name']} @ {run_at.strftime('%H:%M:%S')} (+{CALL_DELAY_MINUTES}min)")
-
-        return jsonify({
-            "status":        "scheduled",
-            "delay_minutes": CALL_DELAY_MINUTES,
-            "fires_at":      run_at.isoformat(),
-            "customer":      checkout["customer_name"],
-            "has_address":   checkout["has_address"],
-        }), 200
-
+        redis_client.ping()
+        redis_status = "connected"
     except Exception as e:
-        log.error(f"Webhook error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        redis_status = f"error: {e}"
+    return jsonify({
+        "status":                  "ok",
+        "redis":                   redis_status,
+        "calls_today":             calls_made_today(),
+        "max_calls_per_day":       MAX_CALLS_PER_DAY,
+        "poll_interval_minutes":   POLL_INTERVAL_MINUTES,
+        "min_abandon_age_minutes": MIN_ABANDON_AGE_MINUTES,
+        "scheduler_jobs":          len(scheduler.get_jobs()),
+    }), 200
 
 
 @app.route("/retell-tool/update-address", methods=["POST"])
 def retell_update_address():
-    """
-    Called by Retell agent after collecting/correcting address from customer.
-    Retell body: { "call": { "call_id": "..." }, "args": { "address1": "...", "city": "...", ... } }
-    Returns a preview for agent to read back to customer.
-    """
+    raw_body  = request.get_data()
+    signature = request.headers.get("X-Retell-Signature", "")
+    if not verify_retell_signature(raw_body, signature):
+        log.warning("Invalid Retell signature on update-address")
+        return jsonify({"result": "Unauthorized"}), 401
+
     try:
-        body = request.get_json(force=True) or {}
+        body = json.loads(raw_body)
         log.info(f"update-address body: {json.dumps(body)}")
 
         call_info = body.get("call", {})
-        call_id   = (call_info.get("call_id") or
-                     request.headers.get("X-Retell-Call-Id") or "")
+        call_id   = call_info.get("call_id") or ""
         args      = body.get("args", body)
 
-        if not call_id or call_id not in active_calls:
+        checkout = get_active_call(call_id)
+        if not checkout:
             return jsonify({"result": "Eroare: sesiune negasita. Va rugam reincercati."}), 200
 
-        addr = active_calls[call_id]["address"]
-
-        # Update only fields that were provided
-        field_map = {
-            "address1":  "address1",
-            "city":      "city",
-            "county":    "province",
-            "zip":       "zip",
-            "first_name": "first_name",
-            "last_name":  "last_name",
-        }
+        addr = checkout["address"]
+        field_map = {"address1": "address1", "city": "city", "county": "province",
+                     "zip": "zip", "first_name": "first_name", "last_name": "last_name"}
         for arg_key, addr_key in field_map.items():
             if args.get(arg_key):
                 addr[addr_key] = args[arg_key]
 
+        save_active_call(call_id, checkout)  # persist the update, refresh TTL
+
         preview = format_address_preview(addr)
         log.info(f"Address updated for {call_id}: {preview}")
-
-        return jsonify({
-            "result": f"Am notat adresa: {preview}. Este corecta?"
-        }), 200
+        return jsonify({"result": f"Am notat adresa: {preview}. Este corecta?"}), 200
 
     except Exception as e:
         log.error(f"update-address error: {e}", exc_info=True)
@@ -303,70 +491,42 @@ def retell_update_address():
 
 @app.route("/retell-tool/place-order-cod", methods=["POST"])
 def retell_place_order_cod():
-    """
-    Called by Retell agent when customer has explicitly confirmed they want the order with COD.
-    Creates a direct Shopify order.
-    Retell body: { "call": {...}, "args": { "confirmed": true } }
-    """
+    raw_body  = request.get_data()
+    signature = request.headers.get("X-Retell-Signature", "")
+    if not verify_retell_signature(raw_body, signature):
+        log.warning("Invalid Retell signature on place-order-cod")
+        return jsonify({"result": "Unauthorized"}), 401
+
     try:
-        body = request.get_json(force=True) or {}
+        body = json.loads(raw_body)
         log.info(f"place-order-cod body: {json.dumps(body)}")
 
         call_info = body.get("call", {})
-        call_id   = (call_info.get("call_id") or request.headers.get("X-Retell-Call-Id") or "")
+        call_id   = call_info.get("call_id") or ""
         args      = body.get("args", body)
         confirmed = args.get("confirmed", False)
 
         if not call_id:
             return jsonify({"result": "Eroare interna. Va rugam finalizati pe nixt.ro."}), 200
-
         if not confirmed:
-            return jsonify({"result": "Comanda nu a fost confirmata."}), 200
+            return jsonify({"result": "Va rog confirmati mai intai comanda."}), 200
 
-        checkout = active_calls.get(call_id)
-        if not checkout:
-            return jsonify({"result": "Sesiune expirata. Va rugam finalizati pe nixt.ro."}), 200
-
-        addr = checkout["address"]
-        line_items = [
-            {"variant_id": item["variant_id"], "quantity": item.get("quantity", 1)}
-            for item in checkout["line_items"]
-            if item.get("variant_id")
-        ]
-
-        if not line_items:
-            return jsonify({"result": "Eroare la procesarea produselor. Va rugam finalizati pe nixt.ro."}), 200
-
-        resp = requests.post(
-            f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json",
-            headers={
-                "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-                "Content-Type": "application/json",
-            },
-            json={
-                "order": {
-                    "line_items":       line_items,
-                    "shipping_address": addr,
-                    "billing_address":  addr,
-                    "email":            checkout.get("email", ""),
-                    "phone":            checkout.get("phone", ""),
-                    "financial_status": "pending",   # COD — plateste la curier
-                    "send_receipt":     True,
-                    "note":             "Comandă plasată prin agent telefonic AI — ramburs",
-                    "tags":             "ai-recovery,abandoned-checkout,ramburs",
-                }
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        
-        # Clean up after successful order
-        active_calls.pop(call_id, None)
+        checkout   = get_active_call(call_id) or {}
+        cart_value = checkout.get("cart_value", "")
+        order      = place_cod_order(call_id)
+        delete_active_call(call_id)
 
         return jsonify({
-            "result": "Comanda a fost plasata cu succes cu plata ramburs. Veti primi un mesaj."
+            "result": (
+                f"Comanda a fost plasata cu succes, numarul {order.get('order_number')}. "
+                f"Veti plati {cart_value} lei ramburs, la livrare. "
+                f"Un curier va va contacta in curand."
+            )
         }), 200
 
+    except ValueError as e:
+        log.error(f"place-order-cod ValueError: {e}")
+        return jsonify({"result": "Nu am putut plasa comanda. Va rugam finalizati pe nixt.ro."}), 200
     except requests.HTTPError as e:
         log.error(f"Shopify error: {e.response.status_code} {e.response.text}")
         return jsonify({"result": "Eroare la Shopify. Va rugam finalizati pe nixt.ro."}), 200
@@ -377,32 +537,32 @@ def retell_place_order_cod():
 
 @app.route("/retell-tool/decline", methods=["POST"])
 def retell_decline():
-    body      = request.get_json(force=True) or {}
+    raw_body  = request.get_data()
+    signature = request.headers.get("X-Retell-Signature", "")
+    if not verify_retell_signature(raw_body, signature):
+        log.warning("Invalid Retell signature on decline")
+        return jsonify({"result": "Unauthorized"}), 401
+
+    body      = json.loads(raw_body)
     call_info = body.get("call", {})
-    call_id   = (call_info.get("call_id") or
-                 request.headers.get("X-Retell-Call-Id") or "")
+    call_id   = call_info.get("call_id") or ""
     if call_id:
-        active_calls.pop(call_id, None)
+        delete_active_call(call_id)
         log.info(f"Call {call_id} declined — data cleaned up")
     return jsonify({"result": "ok"}), 200
 
 
 # ─── TEST ENDPOINTS ───
 
+@app.route("/test/poll-now", methods=["POST"])
+def test_poll_now():
+    process_abandoned_checkouts()
+    return jsonify({"status": "polled", "calls_today": calls_made_today()}), 200
+
+
 @app.route("/test/trigger-call", methods=["POST"])
 def test_trigger_call():
-    """
-    TEST ONLY — fires Retell call immediately, bypassing the delay.
-    POST body (all optional — uses defaults):
-    {
-      "phone": "+40712345678",
-      "customer_name": "Ion Test",
-      "cart_items": "Gel Cuticule 60ml x1",
-      "cart_value": "59",
-      "has_address": "da",
-      "address_preview": "Str. Test 1, Brasov, Brasov, 500001"
-    }
-    """
+    """TEST ONLY — fires a Retell call immediately with synthetic data, bypassing Shopify entirely."""
     body = request.get_json(force=True) or {}
     checkout = {
         "customer_name":   body.get("customer_name", "Ion Test"),
@@ -411,45 +571,57 @@ def test_trigger_call():
         "cart_items":      body.get("cart_items", "Gel Cuticule 60ml x1"),
         "cart_value":      body.get("cart_value", "59"),
         "discount_code":   body.get("discount_code", ""),
-        "checkout_token":  "test_token_999",
+        "checkout_token":  body.get("checkout_token", "test_token_999"),
         "has_address":     body.get("has_address", "da"),
         "address_preview": body.get("address_preview", "Str. Test 1, Brasov, Brasov, 500001"),
         "line_items":      [{"title": "Gel Cuticule 60ml", "variant_id": None, "quantity": 1}],
         "address": {
             "first_name": body.get("customer_name", "Ion").split()[0],
-            "last_name":  "Test",
-            "address1":   "Str. Test 1",
-            "city":       "Brasov",
-            "province":   "Brasov",
-            "zip":        "500001",
-            "country_code": "RO",
-            "phone":      body.get("phone", ""),
+            "last_name":  "Test", "address1": "Str. Test 1", "city": "Brasov",
+            "province": "Brasov", "zip": "500001", "country_code": "RO",
+            "phone": body.get("phone", ""),
         },
     }
-    do_trigger_retell_call(checkout)
-    return jsonify({"status": "triggered", "checkout": checkout}), 200
+    result = do_trigger_retell_call(checkout)
+    return jsonify({"status": "triggered" if result else "failed", "checkout": checkout}), 200
 
 
 @app.route("/test/active-calls", methods=["GET"])
 def test_active_calls():
-    """TEST ONLY — inspect in-memory state."""
+    call_keys   = redis_client.keys("call:*")
+    called_keys = redis_client.keys("called:*")
     return jsonify({
-        "active_calls":  list(active_calls.keys()),
-        "pending_calls": list(pending_calls.keys()),
-        "scheduler_jobs": [j.id for j in scheduler.get_jobs()],
+        "active_calls":       [k.split(":", 1)[1] for k in call_keys],
+        "called_tokens_count": len(called_keys),
+        "calls_today":        calls_made_today(),
     }), 200
 
 
-@app.route("/test/cancel-pending/<token>", methods=["DELETE"])
-def test_cancel_pending(token: str):
-    """TEST ONLY — cancel a scheduled call before it fires."""
-    try:
-        scheduler.remove_job(f"call_{token}")
-        pending_calls.pop(token, None)
-        return jsonify({"status": "cancelled", "token": token}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 404
+@app.route("/test/reset-call-count", methods=["POST"])
+def test_reset_call_count():
+    redis_client.delete(f"calls:{_today_key()}")
+    return jsonify({"status": "reset", "calls_today": 0}), 200
 
+
+@app.route("/test/reset-called-tokens", methods=["POST"])
+def test_reset_called_tokens():
+    keys = redis_client.keys("called:*")
+    if keys:
+        redis_client.delete(*keys)
+    return jsonify({"status": "reset", "cleared": len(keys)}), 200
+
+
+# ─────────────────────────────────────────────
+# STARTUP — schedule the recurring poll job
+# ─────────────────────────────────────────────
+
+scheduler.add_job(
+    process_abandoned_checkouts,
+    trigger="interval",
+    minutes=POLL_INTERVAL_MINUTES,
+    id="poll_abandoned_checkouts",
+    next_run_time=datetime.now(),
+)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
